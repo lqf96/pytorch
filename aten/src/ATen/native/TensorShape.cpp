@@ -22,6 +22,7 @@ namespace at {
 namespace native {
 
 DEFINE_DISPATCH(cat_serial_stub);
+DEFINE_DISPATCH(channel_dim_cat_channels_last_stub);
 
 Tensor _reshape_from_tensor(const Tensor& self, const Tensor& shape_tensor) {
   TORCH_CHECK(shape_tensor.dim() == 1);
@@ -100,6 +101,50 @@ static inline void check_cat_shape_except_dim(const Tensor & first, const Tensor
   }
 }
 
+bool enable_channels_dim_cat_for_channels_last_tensors(
+    const TensorList& tensors, int64_t dim) {
+  if (tensors.empty() || tensors.size() == 1) {
+    return false;
+  }
+  if (dim != 1) {// only channel dim concat supported for now in NHWC.
+    return false;
+  }
+  for(size_t i = 0; i < tensors.size(); ++i) {
+    const auto& t = tensors[i];
+    TORCH_CHECK(t.dim() > 0,
+             "zero-dimensional tensor (at position ", i, ") cannot be concatenated");
+    // Only 4d and 5d tensors supported.
+    if (t.suggest_memory_format() != at::MemoryFormat::ChannelsLast &&
+        t.suggest_memory_format() != at::MemoryFormat::ChannelsLast3d) {
+      return false;
+    }
+    // The need for additional check is to avoid calling contiguous.
+    // Note that just checking is_contig... is not enough
+    // because a tensor of size (2, 1, 3, 4) in contig format
+    // appears as channels_last contig. However, if we are stacking
+    // two such tensors on channel dim, the resulting tensor
+    // (2, 2, 3, 4) in contig format is not not same as channel_last
+    // contig.
+    // And since the output is allocated via
+    // at::empty(...., tensors[0].suggest_memory_format()) to accommodate
+    // both channels_last and channels_last3d, in the example above
+    // we can wrongfully allocate output in contig format but
+    // populate it as if it was channels_last.
+    // So to avoid that we check both if the input is channels_last
+    // and contiguous in that format.
+    if ((!t.is_contiguous(at::MemoryFormat::ChannelsLast) &&
+          !t.is_contiguous(at::MemoryFormat::ChannelsLast3d)) ||
+        t.numel() == 0) {
+      return false;
+    }
+    if (tensors[0].dtype() != t.dtype()) {
+      return false;
+    }
+    check_cat_shape_except_dim(tensors[0], t, dim, i);
+  }
+  return true;
+}
+
 Tensor & _cat_out_cpu(Tensor& result, TensorList tensors, int64_t dim) {
   // previously, size [0] tensors were the only possible empty tensors; thus, it wasn't possible
   // to cat empty tensors unless all the other tensors were 1-dimensional, so we allowed these tensors
@@ -117,6 +162,22 @@ Tensor & _cat_out_cpu(Tensor& result, TensorList tensors, int64_t dim) {
         lap != at::MemOverlapStatus::FULL, 0,
         "unsupported operation: the input tensors cannot refer to any of the "
         "output memory locations. Found overlap in input tensor ", i);
+  }
+
+  // Fast path for channel-dim concat for channels last tensors.
+  if (enable_channels_dim_cat_for_channels_last_tensors(tensors, dim) &&
+      (tensors[0].dtype() == ScalarType::Double ||
+       tensors[0].dtype() == ScalarType::Float)) {
+    // compute the size of the result
+    auto result_size = tensors[0].sizes().vec();
+    size_t concat_dim_size = 0;
+    for (const auto& t: tensors) {
+      concat_dim_size += t.size(dim);
+    }
+    result_size[dim] = concat_dim_size;
+    result.resize_(result_size, tensors[0].suggest_memory_format());
+    channel_dim_cat_channels_last_stub(kCPU, result, tensors);
+    return result;
   }
 
   auto should_skip = [](const Tensor& t) { return t.numel() == 0 && t.dim() == 1; };
